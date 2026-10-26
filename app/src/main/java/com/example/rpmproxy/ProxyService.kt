@@ -10,6 +10,7 @@ import android.bluetooth.BluetoothSocket
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.SystemClock
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetSocketAddress
@@ -45,7 +46,12 @@ class ProxyService : Service() {
         @Volatile var running = false
         @Volatile var carConnected = false
         @Volatile var status = "Остановлен"
-        @Volatile var pedal = 0.0
+        @Volatile var pedal = 0.0          // сглаженная, откалиброванная 0..1
+        @Volatile var rawPedal = 0.0       // сырое значение машины 0..1
+        @Volatile var pedalMin = 0.20      // сырое значение при отпущенной педали
+        @Volatile var pedalMax = 0.83      // сырое значение при педали в пол
+        @Volatile var sampleMs = 200.0     // средний интервал между замерами
+        @Volatile var fastSuffix = true    // ускоренный запрос ELM327 ("01491")
         @Volatile var rpm = IDLE_RPM
         @Volatile var pid = "0149"
         @Volatile var lastRaw = ""
@@ -53,6 +59,11 @@ class ProxyService : Service() {
     }
 
     private val lock = Any()
+    private val interpLock = Any()
+    private var pFrom = 0.0
+    private var pTo = 0.0
+    private var tSample = System.nanoTime()
+    private val cache = HashMap<String, Pair<Long, String>>()
     private var carIn: InputStream? = null
     private var carOut: OutputStream? = null
     private var btSocket: BluetoothSocket? = null
@@ -71,6 +82,8 @@ class ProxyService : Service() {
         running = true
         rpm = IDLE_RPM
         pedal = 0.0
+        synchronized(interpLock) { pFrom = 0.0; pTo = 0.0; tSample = System.nanoTime() }
+        thread { physicsLoop() }
         thread { runProxy(mac) }
         return START_NOT_STICKY
     }
@@ -156,27 +169,81 @@ class ProxyService : Service() {
             .joinToString("\r")
     }
 
-    /** Читаем педаль и считаем виртуальный RPM */
+    /** Опрос педали: крутится без пауз, так быстро, как отвечает адаптер */
     private fun pollLoop() {
         val re = Regex("41(?:49|5A)([0-9A-F]{2})")
         var fails = 0
         while (running && carConnected) {
-            val raw = carCmd(pid)
+            val raw = carCmd(pid + if (fastSuffix) "1" else "")
             lastRaw = raw
+            if (fastSuffix && raw.contains("?")) { fastSuffix = false; continue }
             val m = re.find(raw.replace(" ", ""))
             if (m != null) {
-                pedal = m.groupValues[1].toInt(16) / 255.0
+                onSample(m.groupValues[1].toInt(16) / 255.0)
                 fails = 0
-            } else if (++fails >= 5) {
-                pid = if (pid == "0149") "015A" else "0149"   // пробуем другой PID
-                fails = 0
+            } else {
+                if (++fails >= 5) {
+                    pid = if (pid == "0149") "015A" else "0149"
+                    fails = 0
+                }
+                Thread.sleep(50)
             }
-            val md = MODES[modeIndex]
-            val target = IDLE_RPM + Math.pow(pedal, md.curve) * (md.maxRpm - IDLE_RPM)
-            val k = if (target > rpm) md.up else md.down
-            rpm += (target - rpm) * k
-            Thread.sleep(80)
         }
+    }
+
+    /** Новый замер: плавно ведём педаль от текущего значения к новому за средний интервал */
+    private fun onSample(raw: Double) {
+        rawPedal = raw
+        if (raw < pedalMin) pedalMin = raw
+        if (raw > pedalMax) pedalMax = raw
+        val range = (pedalMax - pedalMin).coerceAtLeast(0.05)
+        val n = ((raw - pedalMin) / range).coerceIn(0.0, 1.0)
+        val now = System.nanoTime()
+        synchronized(interpLock) {
+            val dtMs = (now - tSample) / 1e6
+            sampleMs = sampleMs * 0.7 + dtMs.coerceIn(40.0, 600.0) * 0.3
+            pFrom = interp(now)
+            pTo = n
+            tSample = now
+        }
+    }
+
+    private fun interp(now: Long): Double {
+        val f = ((now - tSample) / 1e6 / sampleMs).coerceIn(0.0, 1.0)
+        return pFrom + (pTo - pFrom) * f
+    }
+
+    /** Физика RPM: 50 раз в секунду, независимо от скорости Bluetooth */
+    private fun physicsLoop() {
+        var last = System.nanoTime()
+        while (running) {
+            Thread.sleep(20)
+            val now = System.nanoTime()
+            val dt = (now - last) / 1e9
+            last = now
+            val p = if (carConnected) synchronized(interpLock) { interp(now) } else 0.0
+            pedal = p
+            val md = MODES[modeIndex]
+            val target = IDLE_RPM + Math.pow(p, md.curve) * (md.maxRpm - IDLE_RPM)
+            val base = if (target > rpm) md.up else md.down
+            val k = 1.0 - Math.pow(1.0 - base, dt / 0.08)
+            rpm += (target - rpm) * k
+        }
+    }
+
+    /** Пересылка в машину; режимы 01 кэшируются на 400 мс, чтобы не забивать Bluetooth */
+    private fun forward(cmd: String): String {
+        val cacheable = cmd.startsWith("01")
+        if (cacheable) {
+            val now = SystemClock.elapsedRealtime()
+            synchronized(cache) {
+                val e = cache[cmd]
+                if (e != null && now - e.first < 400) return e.second
+            }
+        }
+        val r = try { carCmd(cmd) } catch (e: Exception) { "NO DATA" }
+        if (cacheable) synchronized(cache) { cache[cmd] = SystemClock.elapsedRealtime() to r }
+        return r
     }
 
     // ---------------- TCP-сервер для Rev Heads ----------------
@@ -227,8 +294,8 @@ class ProxyService : Service() {
             val raw = (rpm * 4).toInt()
             "41 0C %02X %02X".format((raw shr 8) and 0xFF, raw and 0xFF)
         }
-        cmd == "0100" -> patchSupported(carCmd(cmd))
-        else -> try { carCmd(cmd) } catch (e: Exception) { "NO DATA" }
+        cmd == "0100" -> patchSupported(forward(cmd))
+        else -> forward(cmd)
     }
 
     /** В списке поддерживаемых PID 01-20 обязательно отмечаем 0C (RPM) */
