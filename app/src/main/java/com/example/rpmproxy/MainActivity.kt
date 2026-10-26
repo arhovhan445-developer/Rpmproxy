@@ -81,6 +81,29 @@ class MainActivity : Activity() {
         rpmText = label("RPM: --", 20f)
         root.addView(rpmText)
 
+        root.addView(label("Калибровка педали (нажмите, держа педаль в нужном положении):", 14f))
+        val cal = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val calMin = Button(this).apply { text = "Отпущена = 0%"; textSize = 12f }
+        val calMax = Button(this).apply { text = "В пол = 100%"; textSize = 12f }
+        val calReset = Button(this).apply { text = "Сброс"; textSize = 12f }
+        for (b in listOf(calMin, calMax, calReset))
+            cal.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(cal)
+
+        ProxyService.pedalMin = prefs.getFloat("pmin", 0.20f).toDouble()
+        ProxyService.pedalMax = prefs.getFloat("pmax", 0.83f).toDouble()
+        calMin.setOnClickListener {
+            if (ProxyService.carConnected) { ProxyService.pedalMin = ProxyService.rawPedal; saveCal() }
+        }
+        calMax.setOnClickListener {
+            if (ProxyService.carConnected && ProxyService.rawPedal > ProxyService.pedalMin + 0.05) {
+                ProxyService.pedalMax = ProxyService.rawPedal; saveCal()
+            }
+        }
+        calReset.setOnClickListener {
+            ProxyService.pedalMin = 0.20; ProxyService.pedalMax = 0.83; saveCal()
+        }
+
         root.addView(label("Режим резкости:"))
         val group = RadioGroup(this)
         ProxyService.modeIndex = prefs.getInt("mode", 1).coerceIn(0, ProxyService.MODES.size - 1)
@@ -134,6 +157,13 @@ class MainActivity : Activity() {
         handler.removeCallbacks(tick)
     }
 
+    private fun saveCal() {
+        prefs.edit()
+            .putFloat("pmin", ProxyService.pedalMin.toFloat())
+            .putFloat("pmax", ProxyService.pedalMax.toFloat())
+            .apply()
+    }
+
     private fun refresh() {
         val s = ProxyService
         if (!s.running) {
@@ -148,10 +178,12 @@ class MainActivity : Activity() {
         status.text = "Состояние: ${s.status}\n$rev"
         if (s.carConnected) {
             val p = Math.round(s.pedal * 100).toInt()
-            pedalText.text = "Педаль: $p %"
+            val rawP = Math.round(s.rawPedal * 100).toInt()
+            pedalText.text = "Педаль: $p %  (сырое: $rawP %)"
             bar.progress = p
             rpmText.text = "RPM (виртуальный): ${s.rpm.toInt()}"
-            debugText.text = "PID: ${s.pid}   ответ: ${s.lastRaw}"
+            debugText.text = "PID: ${s.pid}   интервал замера: ${s.sampleMs.toInt()} мс\n" +
+                "диапазон: ${Math.round(s.pedalMin * 100)}-${Math.round(s.pedalMax * 100)} %   ответ: ${s.lastRaw}"
         } else {
             pedalText.text = "Педаль: --"
             rpmText.text = "RPM: --"
