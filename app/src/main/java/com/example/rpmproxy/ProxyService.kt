@@ -66,6 +66,25 @@ class ProxyService : Service() {
         @Volatile var pid = "0149"
         @Volatile var lastRaw = ""
         val clientCount = AtomicInteger(0)
+
+        // журнал: какие команды присылает Rev Heads и что мы отвечаем
+        private val seenCount = LinkedHashMap<String, Int>()
+        private val seenLast = HashMap<String, String>()
+
+        fun noteCmd(cmd: String, resp: String) = synchronized(seenCount) {
+            if (seenCount.size < 200 || seenCount.containsKey(cmd)) {
+                seenCount[cmd] = (seenCount[cmd] ?: 0) + 1
+                seenLast[cmd] = resp
+            }
+        }
+
+        fun clearLog() = synchronized(seenCount) { seenCount.clear(); seenLast.clear() }
+
+        fun cmdLog(): String = synchronized(seenCount) {
+            seenCount.entries.take(25).joinToString("\n") {
+                "${it.key} x${it.value} -> ${seenLast[it.key]?.take(40)}"
+            }
+        }
     }
 
     private val lock = Any()
@@ -97,6 +116,7 @@ class ProxyService : Service() {
         speedKmh = 0.0
         accel = 0.0
         gear = 1
+        clearLog()
         synchronized(interpLock) { pFrom = 0.0; pTo = 0.0; tSample = System.nanoTime() }
         thread { physicsLoop() }
         thread { runProxy(mac) }
@@ -339,6 +359,7 @@ class ProxyService : Service() {
                     sb.setLength(0)
                     if (cmd.isEmpty()) continue
                     val resp = answer(cmd)
+                    noteCmd(cmd, resp)
                     out.write(("$resp\r\r>").toByteArray()); out.flush()
                 } else sb.append(c.toChar())
             }
@@ -351,29 +372,47 @@ class ProxyService : Service() {
 
     private fun hex(v: Double): Int = Math.round(v * 255.0).toInt().coerceIn(0, 255)
 
-    private fun answer(cmd: String): String = when {
-        cmd.startsWith("AT") -> when (cmd) {
-            "ATZ", "ATI" -> "ELM327 v1.5"
-            "AT@1" -> "OBDII to RS232 Interpreter"
-            "ATRV" -> "12.6V"
-            else -> "OK"
+    private fun load(): Double =
+        (0.12 + 0.55 * pedal + 0.33 * (accel / 3.0).coerceIn(0.0, 1.0)).coerceIn(0.0, 1.0)
+
+    /** Данные PID (без "41" и номера PID) или null, если PID не поддерживается */
+    private fun pidData(p: String): String? = when (p) {
+        "00" -> "10 18 80 01"       // 04, 0C, 0D, 11 + есть диапазон 0120
+        "20" -> "00 00 00 01"       // есть диапазон 0140
+        "40" -> "0A 90 00 40"       // 45, 47, 49, 4C, 5A
+        "04" -> "%02X".format(hex(load()))
+        "0C" -> {
+            val raw = (rpm * 4).toInt().coerceIn(0, 65535)
+            "%02X %02X".format((raw shr 8) and 0xFF, raw and 0xFF)
         }
-        // поддерживаем PID: 04, 0C, 0D, 11
-        cmd == "0100" -> "41 00 10 18 80 00"
-        cmd == "0120" || cmd == "0140" -> "41 ${cmd.substring(2)} 00 00 00 00"
-        cmd == "010C" -> {
-            val raw = (rpm * 4).toInt()
-            "41 0C %02X %02X".format((raw shr 8) and 0xFF, raw and 0xFF)
+        "0D" -> "%02X".format(Math.round(speedKmh).toInt().coerceIn(0, 255))
+        "11", "45", "47", "49", "4C", "5A" -> "%02X".format(hex(pedal))   // варианты дросселя/педали
+        else -> null
+    }
+
+    private fun atAnswer(cmd: String): String = when (cmd) {
+        "ATZ", "ATI" -> "ELM327 v1.5"
+        "AT@1" -> "OBDII to RS232 Interpreter"
+        "ATRV" -> "12.6V"
+        "ATDP" -> "AUTO, ISO 15765-4 (CAN 11/500)"
+        "ATDPN" -> "A6"
+        else -> "OK"
+    }
+
+    private fun answer(cmd0: String): String {
+        var cmd = cmd0
+        if (cmd.startsWith("AT")) return atAnswer(cmd)
+        // необязательная цифра "сколько ответов ждать" в конце: 010C1
+        if (cmd.startsWith("01") && cmd.length % 2 == 1) cmd = cmd.dropLast(1)
+        // один или несколько PID в одном запросе: 010C, 010C0D11
+        if (cmd.startsWith("01") && cmd.length >= 4) {
+            val sb = StringBuilder("41")
+            for (id in cmd.substring(2).chunked(2)) {
+                val d = pidData(id) ?: return "NO DATA"
+                sb.append(' ').append(id).append(' ').append(d)
+            }
+            return sb.toString()
         }
-        cmd == "010D" -> "41 0D %02X".format(Math.round(speedKmh).toInt().coerceIn(0, 255))
-        cmd == "0111" -> "41 11 %02X".format(hex(pedal))
-        cmd == "0149" -> "41 49 %02X".format(hex(pedal))
-        cmd == "015A" -> "41 5A %02X".format(hex(pedal))
-        cmd == "0104" -> {
-            // нагрузка двигателя: педаль + ускорение
-            val load = (0.12 + 0.55 * pedal + 0.33 * (accel / 3.0).coerceIn(0.0, 1.0)).coerceIn(0.0, 1.0)
-            "41 04 %02X".format(hex(load))
-        }
-        else -> forward(cmd)
+        return forward(cmd)
     }
 }
