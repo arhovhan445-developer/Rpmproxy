@@ -14,6 +14,7 @@ import android.os.Looper
 import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.RadioButton
@@ -29,6 +30,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var pedalText: TextView
     private lateinit var rpmText: TextView
+    private lateinit var motionText: TextView
     private lateinit var debugText: TextView
     private lateinit var bar: ProgressBar
     private var devices: List<BluetoothDevice> = emptyList()
@@ -80,6 +82,20 @@ class MainActivity : Activity() {
 
         rpmText = label("RPM: --", 20f)
         root.addView(rpmText)
+
+        motionText = label("", 16f)
+        root.addView(motionText)
+        val gbBox = CheckBox(this).apply {
+            text = "Эмуляция коробки передач"
+            textSize = 16f
+            isChecked = prefs.getBoolean("gearbox", true)
+        }
+        ProxyService.gearbox = gbBox.isChecked
+        gbBox.setOnCheckedChangeListener { _, c ->
+            ProxyService.gearbox = c
+            prefs.edit().putBoolean("gearbox", c).apply()
+        }
+        root.addView(gbBox)
 
         root.addView(label("Калибровка педали (нажмите, держа педаль в нужном положении):", 14f))
         val cal = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
@@ -166,6 +182,7 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         val s = ProxyService
+        motionText.text = ""
         if (!s.running) {
             status.text = "Состояние: остановлен"
             pedalText.text = "Педаль: --"
@@ -181,6 +198,8 @@ class MainActivity : Activity() {
             val rawP = Math.round(s.rawPedal * 100).toInt()
             pedalText.text = "Педаль: $p %  (сырое: $rawP %)"
             bar.progress = p
+            motionText.text = "Скорость: %d км/ч   Ускорение: %.1f м/с²   Передача: %s".format(
+                Math.round(s.speedKmh).toInt(), s.accel, if (s.gearbox) s.gear.toString() else "-")
             rpmText.text = "RPM (виртуальный): ${s.rpm.toInt()}"
             debugText.text = "PID: ${s.pid}   интервал замера: ${s.sampleMs.toInt()} мс\n" +
                 "диапазон: ${Math.round(s.pedalMin * 100)}-${Math.round(s.pedalMax * 100)} %   ответ: ${s.lastRaw}"
