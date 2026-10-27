@@ -24,7 +24,9 @@ data class Mode(val name: String, val up: Double, val down: Double, val curve: D
 
 /**
  * Прокси ELM327: Volt <-> (Bluetooth) <-> сервис <-> (TCP :35000) <-> Rev Heads.
- * 010C (RPM) подменяется значением, рассчитанным от педали газа.
+ * Из машины читаются педаль (0149/015A) и скорость (010D). Rev Heads получает:
+ *   010C RPM (виртуальная коробка передач), 010D скорость (сглаженная),
+ *   0111 положение дросселя, 0104 нагрузка (зависит от педали и ускорения).
  */
 class ProxyService : Service() {
 
@@ -33,7 +35,7 @@ class ProxyService : Service() {
         const val IDLE_RPM = 850.0
         val SPP: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
 
-        // up/down - скорость роста/падения оборотов (0..1 за шаг 80 мс),
+        // up/down - скорость роста/падения оборотов (0..1 за 80 мс),
         // curve < 1 делает педаль чувствительнее, > 1 мягче
         val MODES = listOf(
             Mode("Мягкий", 0.06, 0.04, 1.3, 4500.0),
@@ -42,17 +44,25 @@ class ProxyService : Service() {
             Mode("Спорт", 0.50, 0.35, 0.65, 7000.0)
         )
 
+        // оборотов двигателя на 1 км/ч для каждой передачи (1..6)
+        val GEAR_RATIO = doubleArrayOf(120.0, 70.0, 48.0, 36.0, 28.0, 22.0)
+
         @Volatile var modeIndex = 1
+        @Volatile var gearbox = true       // эмуляция коробки передач
         @Volatile var running = false
         @Volatile var carConnected = false
         @Volatile var status = "Остановлен"
         @Volatile var pedal = 0.0          // сглаженная, откалиброванная 0..1
         @Volatile var rawPedal = 0.0       // сырое значение машины 0..1
-        @Volatile var pedalMin = 0.20      // сырое значение при отпущенной педали
-        @Volatile var pedalMax = 0.83      // сырое значение при педали в пол
-        @Volatile var sampleMs = 200.0     // средний интервал между замерами
+        @Volatile var pedalMin = 0.20
+        @Volatile var pedalMax = 0.83
+        @Volatile var sampleMs = 200.0     // средний интервал между замерами педали
         @Volatile var fastSuffix = true    // ускоренный запрос ELM327 ("01491")
         @Volatile var rpm = IDLE_RPM
+        @Volatile var speedSample = 0.0    // последний замер скорости из машины, км/ч
+        @Volatile var speedKmh = 0.0       // сглаженная скорость, км/ч
+        @Volatile var accel = 0.0          // ускорение, м/с²
+        @Volatile var gear = 1
         @Volatile var pid = "0149"
         @Volatile var lastRaw = ""
         val clientCount = AtomicInteger(0)
@@ -64,6 +74,7 @@ class ProxyService : Service() {
     private var pTo = 0.0
     private var tSample = System.nanoTime()
     private val cache = HashMap<String, Pair<Long, String>>()
+
     private var carIn: InputStream? = null
     private var carOut: OutputStream? = null
     private var btSocket: BluetoothSocket? = null
@@ -82,6 +93,10 @@ class ProxyService : Service() {
         running = true
         rpm = IDLE_RPM
         pedal = 0.0
+        speedSample = 0.0
+        speedKmh = 0.0
+        accel = 0.0
+        gear = 1
         synchronized(interpLock) { pFrom = 0.0; pTo = 0.0; tSample = System.nanoTime() }
         thread { physicsLoop() }
         thread { runProxy(mac) }
@@ -112,7 +127,6 @@ class ProxyService : Service() {
 
     @SuppressLint("MissingPermission")
     private fun runProxy(mac: String) {
-        // 1. Сначала поднимаем сервер для Rev Heads
         try {
             val ss = ServerSocket()
             ss.reuseAddress = true
@@ -126,7 +140,6 @@ class ProxyService : Service() {
             return
         }
 
-        // 2. Подключаемся к адаптеру, при обрыве пробуем снова
         val bt = BluetoothAdapter.getDefaultAdapter()
         while (running) {
             try {
@@ -169,15 +182,26 @@ class ProxyService : Service() {
             .joinToString("\r")
     }
 
-    /** Опрос педали: крутится без пауз, так быстро, как отвечает адаптер */
+    /** Опрос машины без пауз: педаль каждый цикл, скорость каждый третий */
     private fun pollLoop() {
-        val re = Regex("41(?:49|5A)([0-9A-F]{2})")
+        val rePedal = Regex("41(?:49|5A)([0-9A-F]{2})")
+        val reSpeed = Regex("410D([0-9A-F]{2})")
         var fails = 0
+        var n = 0
         while (running && carConnected) {
+            n++
+            if (n % 3 == 0) {
+                val r = carCmd("010D" + if (fastSuffix) "1" else "")
+                if (fastSuffix && r.contains("?")) { fastSuffix = false; continue }
+                reSpeed.find(r.replace(" ", ""))?.let {
+                    speedSample = it.groupValues[1].toInt(16).toDouble()
+                }
+                continue
+            }
             val raw = carCmd(pid + if (fastSuffix) "1" else "")
             lastRaw = raw
             if (fastSuffix && raw.contains("?")) { fastSuffix = false; continue }
-            val m = re.find(raw.replace(" ", ""))
+            val m = rePedal.find(raw.replace(" ", ""))
             if (m != null) {
                 onSample(m.groupValues[1].toInt(16) / 255.0)
                 fails = 0
@@ -191,7 +215,7 @@ class ProxyService : Service() {
         }
     }
 
-    /** Новый замер: плавно ведём педаль от текущего значения к новому за средний интервал */
+    /** Новый замер педали: плавно ведём значение от текущего к новому за средний интервал */
     private fun onSample(raw: Double) {
         rawPedal = raw
         if (raw < pedalMin) pedalMin = raw
@@ -213,19 +237,61 @@ class ProxyService : Service() {
         return pFrom + (pTo - pFrom) * f
     }
 
-    /** Физика RPM: 50 раз в секунду, независимо от скорости Bluetooth */
+    /** Физика: 50 раз в секунду - скорость, ускорение, передача, RPM */
     private fun physicsLoop() {
         var last = System.nanoTime()
+        var lastSpeed = 0.0
+        var shiftUntil = 0L
+        var lastShift = 0L
         while (running) {
             Thread.sleep(20)
             val now = System.nanoTime()
             val dt = (now - last) / 1e9
             last = now
+            val nowMs = now / 1_000_000
+
             val p = if (carConnected) synchronized(interpLock) { interp(now) } else 0.0
             pedal = p
+
+            // скорость сглаживаем, ускорение считаем из её изменения
+            val spTarget = if (carConnected) speedSample else 0.0
+            speedKmh += (spTarget - speedKmh) * (1.0 - Math.exp(-dt / 0.3))
+            val rawAcc = (speedKmh - lastSpeed) / 3.6 / dt
+            lastSpeed = speedKmh
+            accel += (rawAcc - accel) * (1.0 - Math.exp(-dt / 0.4))
+
             val md = MODES[modeIndex]
-            val target = IDLE_RPM + Math.pow(p, md.curve) * (md.maxRpm - IDLE_RPM)
-            val base = if (target > rpm) md.up else md.down
+            val target: Double
+            if (gearbox) {
+                val ratio = GEAR_RATIO
+                var g = gear.coerceIn(1, ratio.size)
+                if (speedKmh < 5.0) {
+                    g = 1
+                } else if (nowMs >= shiftUntil && nowMs - lastShift > 700) {
+                    val up = 2300.0 + p * (md.maxRpm * 0.8 - 2300.0)   // с педалью переключаемся позже
+                    val down = 1100.0 + p * 1300.0                      // сильная педаль = kickdown
+                    val cur = speedKmh * ratio[g - 1]
+                    if (g < ratio.size && cur > up) {
+                        g++; shiftUntil = nowMs + 350; lastShift = nowMs
+                    } else if (g > 1 && cur < down && speedKmh * ratio[g - 2] < up * 0.92) {
+                        g--; shiftUntil = nowMs + 300; lastShift = nowMs
+                    }
+                }
+                gear = g
+                // во время переключения тяга обрывается: обороты падают к новой передаче
+                val pe = if (nowMs < shiftUntil) 0.0 else p
+                val shaped = Math.pow(pe, md.curve)
+                val launch = IDLE_RPM + shaped * (Math.min(md.maxRpm, 3500.0) - IDLE_RPM)  // стоим/трогаемся
+                val geared = speedKmh * ratio[g - 1] + shaped * 600.0                      // едем на передаче
+                val w = (speedKmh / 15.0).coerceIn(0.0, 1.0)
+                target = (launch * (1.0 - w) + geared * w).coerceIn(IDLE_RPM, md.maxRpm)
+            } else {
+                gear = 0
+                target = IDLE_RPM + Math.pow(p, md.curve) * (md.maxRpm - IDLE_RPM)
+            }
+
+            var base = if (target > rpm) md.up else md.down
+            if (nowMs < shiftUntil && target < rpm) base = Math.max(base, 0.3)  // резкий провал при переключении
             val k = 1.0 - Math.pow(1.0 - base, dt / 0.08)
             rpm += (target - rpm) * k
         }
@@ -283,6 +349,8 @@ class ProxyService : Service() {
         }
     }
 
+    private fun hex(v: Double): Int = Math.round(v * 255.0).toInt().coerceIn(0, 255)
+
     private fun answer(cmd: String): String = when {
         cmd.startsWith("AT") -> when (cmd) {
             "ATZ", "ATI" -> "ELM327 v1.5"
@@ -290,20 +358,22 @@ class ProxyService : Service() {
             "ATRV" -> "12.6V"
             else -> "OK"
         }
+        // поддерживаем PID: 04, 0C, 0D, 11
+        cmd == "0100" -> "41 00 10 18 80 00"
+        cmd == "0120" || cmd == "0140" -> "41 ${cmd.substring(2)} 00 00 00 00"
         cmd == "010C" -> {
             val raw = (rpm * 4).toInt()
             "41 0C %02X %02X".format((raw shr 8) and 0xFF, raw and 0xFF)
         }
-        cmd == "0100" -> patchSupported(forward(cmd))
+        cmd == "010D" -> "41 0D %02X".format(Math.round(speedKmh).toInt().coerceIn(0, 255))
+        cmd == "0111" -> "41 11 %02X".format(hex(pedal))
+        cmd == "0149" -> "41 49 %02X".format(hex(pedal))
+        cmd == "015A" -> "41 5A %02X".format(hex(pedal))
+        cmd == "0104" -> {
+            // нагрузка двигателя: педаль + ускорение
+            val load = (0.12 + 0.55 * pedal + 0.33 * (accel / 3.0).coerceIn(0.0, 1.0)).coerceIn(0.0, 1.0)
+            "41 04 %02X".format(hex(load))
+        }
         else -> forward(cmd)
-    }
-
-    /** В списке поддерживаемых PID 01-20 обязательно отмечаем 0C (RPM) */
-    private fun patchSupported(resp: String): String {
-        val line = resp.split("\r").firstOrNull { it.replace(" ", "").startsWith("4100") }
-            ?: return "41 00 00 10 00 00"
-        val bytes = line.replace(" ", "").chunked(2).map { it.toInt(16) }.toMutableList()
-        if (bytes.size >= 6) bytes[3] = bytes[3] or 0x10
-        return bytes.joinToString(" ") { "%02X".format(it) }
     }
 }
