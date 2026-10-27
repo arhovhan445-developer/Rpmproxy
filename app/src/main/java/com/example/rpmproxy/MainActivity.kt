@@ -5,6 +5,8 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
@@ -32,6 +34,7 @@ class MainActivity : Activity() {
     private lateinit var rpmText: TextView
     private lateinit var motionText: TextView
     private lateinit var debugText: TextView
+    private lateinit var logText: TextView
     private lateinit var bar: ProgressBar
     private var devices: List<BluetoothDevice> = emptyList()
 
@@ -145,6 +148,16 @@ class MainActivity : Activity() {
         debugText = label("", 12f)
         root.addView(debugText)
 
+        root.addView(label("Что запрашивает Rev Heads:", 14f))
+        logText = label("", 12f)
+        root.addView(logText)
+        val copyBtn = Button(this).apply { text = "Копировать лог запросов"; textSize = 12f }
+        copyBtn.setOnClickListener {
+            val cm = getSystemService(ClipboardManager::class.java)
+            cm.setPrimaryClip(ClipData.newPlainText("log", ProxyService.cmdLog() + "\n" + debugText.text))
+        }
+        root.addView(copyBtn)
+
         setContentView(ScrollView(this).apply { addView(root) })
 
         start.setOnClickListener {
@@ -183,6 +196,7 @@ class MainActivity : Activity() {
     private fun refresh() {
         val s = ProxyService
         motionText.text = ""
+        logText.text = ProxyService.cmdLog()
         if (!s.running) {
             status.text = "Состояние: остановлен"
             pedalText.text = "Педаль: --"
