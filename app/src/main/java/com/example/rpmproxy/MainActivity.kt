@@ -13,6 +13,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
@@ -35,6 +36,7 @@ class MainActivity : Activity() {
     private lateinit var motionText: TextView
     private lateinit var debugText: TextView
     private lateinit var logText: TextView
+    private lateinit var holdBtn: Button
     private lateinit var bar: ProgressBar
     private var devices: List<BluetoothDevice> = emptyList()
 
@@ -53,6 +55,12 @@ class MainActivity : Activity() {
         setPadding(0, 24, 0, 8)
     }
 
+    private fun row(vararg views: View): LinearLayout {
+        val r = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        for (v in views) r.addView(v, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
+        return r
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -65,12 +73,15 @@ class MainActivity : Activity() {
         spinner = Spinner(this)
         root.addView(spinner)
 
-        val buttons = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val start = Button(this).apply { text = "Старт" }
+        val start = Button(this).apply { text = "Старт (ELM)" }
         val stop = Button(this).apply { text = "Стоп" }
-        buttons.addView(start, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        buttons.addView(stop, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(buttons)
+        root.addView(row(start, stop))
+
+        val demoBtn = Button(this).apply { text = "Демо без ELM (акселерометр + GPS)" }
+        root.addView(demoBtn)
+
+        holdBtn = Button(this)
+        root.addView(holdBtn)
 
         status = label("", 15f)
         root.addView(status)
@@ -100,14 +111,11 @@ class MainActivity : Activity() {
         }
         root.addView(gbBox)
 
-        root.addView(label("Калибровка педали (нажмите, держа педаль в нужном положении):", 14f))
-        val cal = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        root.addView(label("Калибровка педали (только режим ELM):", 14f))
         val calMin = Button(this).apply { text = "Отпущена = 0%"; textSize = 12f }
         val calMax = Button(this).apply { text = "В пол = 100%"; textSize = 12f }
         val calReset = Button(this).apply { text = "Сброс"; textSize = 12f }
-        for (b in listOf(calMin, calMax, calReset))
-            cal.addView(b, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(cal)
+        root.addView(row(calMin, calMax, calReset))
 
         ProxyService.pedalMin = prefs.getFloat("pmin", 0.20f).toDouble()
         ProxyService.pedalMax = prefs.getFloat("pmax", 0.83f).toDouble()
@@ -172,8 +180,25 @@ class MainActivity : Activity() {
         stop.setOnClickListener {
             stopService(Intent(this, ProxyService::class.java))
         }
+        demoBtn.setOnClickListener { startDemo() }
+
+        // пауза для Rev Heads: скорость = 0 на 10 секунд, повторное нажатие отменяет
+        holdBtn.setOnClickListener {
+            val now = SystemClock.elapsedRealtime()
+            ProxyService.holdUntilMs = if (now < ProxyService.holdUntilMs) 0L else now + 10_000L
+        }
 
         requestNeededPermissions()
+    }
+
+    private fun startDemo() {
+        if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 2
+            )
+            return
+        }
+        startForegroundService(Intent(this, ProxyService::class.java).putExtra("demo", true))
     }
 
     override fun onResume() {
@@ -195,8 +220,12 @@ class MainActivity : Activity() {
 
     private fun refresh() {
         val s = ProxyService
+        val left = s.holdUntilMs - SystemClock.elapsedRealtime()
+        holdBtn.text = if (left > 0) "Скорость = 0: осталось ${(left + 999) / 1000} с (нажмите для отмены)"
+        else "Пауза для Rev Heads: скорость 0 на 10 с"
         motionText.text = ""
         logText.text = ProxyService.cmdLog()
+
         if (!s.running) {
             status.text = "Состояние: остановлен"
             pedalText.text = "Педаль: --"
@@ -207,16 +236,27 @@ class MainActivity : Activity() {
         }
         val rev = if (s.clientCount.get() > 0) "Rev Heads подключён" else "Rev Heads не подключён"
         status.text = "Состояние: ${s.status}\n$rev"
-        if (s.carConnected) {
+
+        if (s.demo || s.carConnected) {
             val p = Math.round(s.pedal * 100).toInt()
-            val rawP = Math.round(s.rawPedal * 100).toInt()
-            pedalText.text = "Педаль: $p %  (сырое: $rawP %)"
             bar.progress = p
             motionText.text = "Скорость: %d км/ч   Ускорение: %.1f м/с²   Передача: %s".format(
                 Math.round(s.speedKmh).toInt(), s.accel, if (s.gearbox) s.gear.toString() else "-")
             rpmText.text = "RPM (виртуальный): ${s.rpm.toInt()}"
-            debugText.text = "PID: ${s.pid}   интервал замера: ${s.sampleMs.toInt()} мс\n" +
-                "диапазон: ${Math.round(s.pedalMin * 100)}-${Math.round(s.pedalMax * 100)} %   ответ: ${s.lastRaw}"
+            if (s.demo) {
+                pedalText.text = "Виртуальная педаль: $p %"
+                val gpsAge = (SystemClock.elapsedRealtime() - s.demoGpsMs) / 1000
+                val gps = if (s.demoGpsMs == 0L) "нет сигнала (выйдите на открытое место)"
+                else "%d км/ч (%d с назад)".format(Math.round(s.demoGpsKmh).toInt(), gpsAge)
+                val axis = if (s.demoAxisOk) "определено"
+                else "ещё нет: закрепите телефон и пару раз разгонитесь/затормозите"
+                debugText.text = "GPS: $gps\nУскорение вперёд: %.1f м/с²\nНаправление движения: $axis".format(s.demoAF)
+            } else {
+                val rawP = Math.round(s.rawPedal * 100).toInt()
+                pedalText.text = "Педаль: $p %  (сырое: $rawP %)"
+                debugText.text = "PID: ${s.pid}   интервал замера: ${s.sampleMs.toInt()} мс\n" +
+                    "диапазон: ${Math.round(s.pedalMin * 100)}-${Math.round(s.pedalMax * 100)} %   ответ: ${s.lastRaw}"
+            }
         } else {
             pedalText.text = "Педаль: --"
             rpmText.text = "RPM: --"
@@ -239,7 +279,15 @@ class MainActivity : Activity() {
 
     override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
         super.onRequestPermissionsResult(code, perms, results)
-        loadDevices()
+        if (code == 2) {
+            if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+                startDemo()
+            } else {
+                status.text = "Для демо-режима нужен доступ к точной геолокации."
+            }
+        } else {
+            loadDevices()
+        }
     }
 
     @SuppressLint("MissingPermission")
